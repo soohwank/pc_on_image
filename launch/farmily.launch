@@ -1,0 +1,20 @@
+<?xml version="1.0"?>
+<launch>
+
+    <!-- SWAN: disabled
+    <param name="maxlen"        type="double" value="100" />    
+    <param name="minlen"        type="double" value="0.2" />    
+    <param name="max_ang_FOV"   type="double" value="2.7" />
+    <param name="min_ang_FOV"   type="double" value="0.5" />
+     -->
+
+    <param name="pcTopic"       type="str"    value="/velodyne_points" />
+    <param name="imgTopic"      type="str"    value="/zed2i/zed_node/left_raw/image_raw_color" />
+
+    <group ns="matrix_file">
+        <rosparam file="$(find pc_on_img)/cfg/farmily.yaml" />
+    </group>
+    
+    <node pkg="pc_on_img" type="pc_on_img_node" name="pc_on_img_node" output="screen"/>
+  
+</launch>

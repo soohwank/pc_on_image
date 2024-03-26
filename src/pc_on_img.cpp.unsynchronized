@@ -1,0 +1,252 @@
+#include <ros/ros.h>
+#include <sensor_msgs/Image.h>
+#include <cv_bridge/cv_bridge.h>
+#include <pcl_ros/point_cloud.h>
+#include <pcl_conversions/pcl_conversions.h>
+#include <image_transport/image_transport.h>
+#include <pcl/point_types.h>
+#include <pcl/range_image/range_image_spherical.h>
+#include <pcl/filters/filter.h>
+//#include <pcl/common/impl/transforms.hpp> // SWAN: transform
+#include <opencv2/core/core.hpp>
+#include <math.h>
+
+#include <sensor_msgs/Image.h>
+#include <sensor_msgs/PointCloud2.h>
+
+#include <message_filters/subscriber.h>
+#include <message_filters/time_synchronizer.h>
+#include <message_filters/synchronizer.h>
+#include <message_filters/sync_policies/approximate_time.h>
+
+#include <opencv2/highgui/highgui.hpp>
+#include <Eigen/Dense>
+
+using namespace Eigen;
+using namespace sensor_msgs;
+using namespace message_filters;
+using namespace std;
+
+typedef pcl::PointCloud<pcl::PointXYZ> PointCloud;
+ros::Publisher pcOnimg_pub;
+ros::Publisher pub;
+
+// float maxlen = 10;
+// float minlen = 0.1;
+// float max_FOV = 1.6;
+// float min_FOV = 0.9;
+std::string imgTopic = "/velodyne_points";
+std::string pcTopic = "/blackflys/image_raw";
+
+Eigen::MatrixXf L_R_C(3,3); // rotation matrix lidar-camera
+Eigen::MatrixXf L_t_C(3,1); // translation matrix lidar-camera
+
+Eigen::MatrixXf C_R_L(3,3); // rotation matrix lidar-camera
+Eigen::MatrixXf C_t_L(3,1); // translation matrix lidar-camera
+
+Eigen::MatrixXf M(3, 4);    // camera calibration matrix
+Eigen::MatrixXf D(1, 5);    // camera distortion
+
+// additional transformation matrix
+Eigen::MatrixXf T(4, 4);
+
+// camera image
+cv::Mat in_image;
+
+void callback_camera(const ImageConstPtr& in_image_)
+{
+  ROS_INFO("callback_camera");
+
+  // From ROS image to OpenCV image
+  cv_bridge::CvImagePtr cv_ptr;
+  try
+  {
+    cv_ptr = cv_bridge::toCvCopy(in_image_, sensor_msgs::image_encodings::BGR8);
+  }
+  catch (cv_bridge::Exception& e)
+  {
+    ROS_ERROR("cv_bridge exception: %s", e.what());
+    return;
+  }
+
+  in_image = cv_ptr->image;
+
+  pcOnimg_pub.publish(cv_ptr->toImageMsg());
+}
+
+void callback_lidar(const boost::shared_ptr<const sensor_msgs::PointCloud2>& in_pc2)
+{
+  if (in_image.data == nullptr) return;
+
+  ROS_INFO("callback_lidar");
+ 
+  //Conversion from sensor_msgs::PointCloud2 to pcl::PointCloud<T>
+  pcl::PCLPointCloud2 pcl_pc2;
+  pcl_conversions::toPCL(*in_pc2, pcl_pc2);
+  pcl::PointCloud<pcl::PointXYZ>::Ptr msg_pointCloud(new pcl::PointCloud<pcl::PointXYZ>);
+  pcl::fromPCLPointCloud2(pcl_pc2, *msg_pointCloud);
+  ///
+
+  ////// filter point cloud
+  if (msg_pointCloud == NULL) return;
+
+  PointCloud::Ptr cloud_in (new PointCloud);
+  PointCloud::Ptr cloud_out (new PointCloud);
+
+  cloud_out->header.frame_id = "velodyne";
+  std::vector<int> indices;
+
+  pcl::removeNaNFromPointCloud(*msg_pointCloud, *cloud_in, indices);
+
+  // SWAN: additional transform
+  // for (int i = 0; i < (int) cloud_in->points.size(); i++)
+  // {
+  //   float x = cloud_in->points[i].x;
+  //   float y = cloud_in->points[i].y;
+  //   float z = cloud_in->points[i].z;
+
+  //   cloud_in->points[i].x = T(0, 0)*x + T(0, 1)*y + T(0, 2)*z + T(0, 3);
+  //   cloud_in->points[i].y = T(1, 0)*x + T(1, 1)*y + T(1, 2)*z + T(1, 3);
+  //   cloud_in->points[i].z = T(2, 0)*x + T(2, 1)*y + T(2, 2)*z + T(2, 3);
+  // }
+
+  for (int i = 0; i < (int) cloud_in->points.size(); i++)
+  {
+      // double distance = sqrt(cloud_in->points[i].x * cloud_in->points[i].x + cloud_in->points[i].y * cloud_in->points[i].y);
+      // if(distance < minlen || distance > maxlen || cloud_in->points[i].x < 0)
+      //     continue;
+      // float ang = atan(cloud_in->points[i].x / cloud_in->points[i].y);
+      // if(cloud_in->points[i].y < 0)
+      //   ang = M_PI+ ang;
+      // if (ang < min_FOV || ang > max_FOV)
+      //     continue;
+      cloud_out->push_back(cloud_in->points[i]);
+  }
+
+  Eigen::MatrixXf C_T_L(4,4); // translation matrix lidar-camera
+  C_T_L << C_R_L(0), C_R_L(3), C_R_L(6), C_t_L(0),
+           C_R_L(1), C_R_L(4), C_R_L(7), C_t_L(1),
+           C_R_L(2), C_R_L(5), C_R_L(8), C_t_L(2),
+           0,        0,        0,        1;
+  //C_T_L = T.inverse() * C_T_L * T;
+
+  int n = (int) cloud_out->points.size(); // number of points
+  Eigen::MatrixXf I_p(3, n);
+  Eigen::MatrixXf L_p(4, n);
+  Eigen::MatrixXf C_p(4, n);
+
+  for (int i = 0; i < n; i++)
+  {
+      // L_p(0,i) = -cloud_out->points[i].y;
+      // L_p(1,i) = -cloud_out->points[i].z;
+      // L_p(2,i) =  cloud_out->points[i].x;
+
+      L_p(0,i) = cloud_out->points[i].x;
+      L_p(1,i) = cloud_out->points[i].y;
+      L_p(2,i) = cloud_out->points[i].z;
+
+      L_p(3,i) = 1.0;
+  }
+
+  // I_p = K * [C_R_L, C_t_L] * L_p
+  // 3xn  3x3       3x4        4xn
+
+  // I_p = [K, 0] * [C_R_L, C_t_L] * L_p
+  //                [  0,     1  ]
+  // 3xn     3x4          4x4        4xn
+
+  // I_p = M * L_T_C * L_p
+  // 3xn  3x4   4x4    4xn
+
+  // I_p = M * C_p
+  // 3xn  3x4  4xn
+
+  // C_p = C_T_L * L_p
+  C_p = C_T_L * L_p;
+
+  I_p = M * C_p;
+
+  float x, y, z;
+  int u = 0;
+  int v = 0;
+  unsigned int cols = in_image.cols;
+  unsigned int rows = in_image.rows;
+
+  for (int i = 0; i < n; i++)
+  {
+    // C_p
+    x = I_p(0,i);
+    y = I_p(1,i);
+    z = I_p(2,i);
+
+    // I_p
+    u = (int)(x/z);
+    v = (int)(y/z);
+
+    if(u < 0.0 || u > cols || v < 0.0 || v > rows) continue;
+ // int color_dis_x = (int)(255*((cloud_out->points[i].x)/maxlen));
+    int color_dis_x = (int)(255*((cloud_out->points[i].x)/10.0));
+    int color_dis_z = (int)(255*((cloud_out->points[i].x)/20.0));
+    if(color_dis_z > 255) color_dis_z = 255;
+
+    cv::circle(in_image, cv::Point(u, v), 5, CV_RGB(255-color_dis_x,(int)(color_dis_z),color_dis_x),cv::FILLED);
+  }
+
+  pcl_conversions::toPCL(ros::Time::now(), cloud_out->header.stamp);
+  pub.publish (cloud_out);
+}
+
+int main(int argc, char** argv)
+{
+
+  ros::init(argc, argv, "pontCloudOntImage");
+  ros::NodeHandle nh;  
+
+  /// Load Parameters
+
+  // nh.getParam("/maxlen", maxlen);
+  // nh.getParam("/minlen", minlen);
+  // nh.getParam("/max_ang_FOV", max_FOV);
+  // nh.getParam("/min_ang_FOV", min_FOV);
+  nh.getParam("/pcTopic", pcTopic);
+  nh.getParam("/imgTopic", imgTopic);
+
+  XmlRpc::XmlRpcValue param;
+
+  nh.getParam("/matrix_file/rlc", param);
+  L_R_C << (double)param[0], (double)param[1], (double)param[2],
+           (double)param[3], (double)param[4], (double)param[5],
+           (double)param[6], (double)param[7], (double)param[8];
+  C_R_L = L_R_C.transpose();
+  //C_R_L = L_R_C;
+
+  nh.getParam("/matrix_file/tlc", param);
+  L_t_C << (double)param[0],
+           (double)param[1],
+           (double)param[2];
+  C_t_L = - C_R_L * L_t_C;  
+  //C_t_L = L_t_C;
+
+  nh.getParam("/matrix_file/camera_matrix", param);
+  M  << (double)param[0], (double)param[1], (double)param[2],  (double)param[3],
+        (double)param[4], (double)param[5], (double)param[6],  (double)param[7],
+        (double)param[8], (double)param[9], (double)param[10], (double)param[11];
+
+  nh.getParam("/matrix_file/distortion", param);
+  D << (double)param[0], (double)param[1], (double)param[2],  (double)param[3], (double)param[4];
+
+  nh.getParam("/matrix_file/transform", param);
+  T << (double)param[0],  (double)param[1],  (double)param[2],  (double)param[3],
+       (double)param[4],  (double)param[5],  (double)param[6],  (double)param[7],
+       (double)param[8],  (double)param[9],  (double)param[10], (double)param[11],
+       (double)param[12], (double)param[13], (double)param[14], (double)param[15];
+
+  ros::Subscriber pc_sub  = nh.subscribe(pcTopic.c_str(),  1, callback_lidar);
+  ros::Subscriber img_sub = nh.subscribe(imgTopic.c_str(), 1, callback_camera);
+
+  pcOnimg_pub = nh.advertise<sensor_msgs::Image>("/pcOnImage_image", 1);
+  pub = nh.advertise<PointCloud> ("/points2", 1);
+
+  ros::spin();
+  //return 0;
+}
