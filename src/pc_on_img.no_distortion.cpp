@@ -44,35 +44,6 @@ cv::Point2f projectPointDist(cv::Point3f pt_cv, const cv::Mat intrinsics,
   return projectedPoints[0];
 }
 
-Eigen::MatrixXf projectPointDist(Eigen::MatrixXf C_points, const cv::Mat intrinsics,
-                                                       const cv::Mat distCoeffs) {
-  // Project a 3D point taking into account distortion
-  const int n = static_cast<int>(C_points.cols());
-
-  vector<cv::Point3f> input;
-  for (int i = 0; i < n; i++)
-  {
-    input.push_back(cv::Point3f(C_points(0, i),
-                                C_points(1, i),
-                                C_points(2, i)));
-  }
-
-  vector<cv::Point2f> projectedPoints;
-  projectedPoints.resize(n);
-  cv::projectPoints(input, cv::Mat::zeros(3, 1, CV_64FC1), cv::Mat::zeros(3, 1, CV_64FC1),
-                    intrinsics, distCoeffs, projectedPoints);
-
-  Eigen::MatrixXf I_p(3, n);
-  for (int i = 0; i < n; i++)
-  {
-    I_p(0, i) = projectedPoints[i].x;
-    I_p(1, i) = projectedPoints[i].y;
-    I_p(2, i) = 1.f;
-  }
-
-  return I_p;
-}
-
 ros::Publisher pcOnimg_pub;
 ros::Publisher pub;
 
@@ -87,8 +58,8 @@ std::string pcTopic = "/blackflys/image_raw";
 Eigen::MatrixXf C_T_L(4, 4);
 
 // Intrinsic parameters
-//Eigen::MatrixXf M(3, 4);    // camera calibration matrix
-//Eigen::MatrixXf D(1, 5);    // camera distortion
+Eigen::MatrixXf M(3, 4);    // camera calibration matrix
+Eigen::MatrixXf D(1, 5);    // camera distortion
 cv::Mat cameraMatrix(3, 3, CV_32F);
 cv::Mat distCoeffs(1, 5, CV_32F);
 
@@ -180,9 +151,9 @@ void reviseTransformation(Eigen::MatrixXf &L_R_C_ROS, Eigen::MatrixXf &L_t_C_ROS
                0,        0,        0,        1;
 
   Eigen::MatrixXf C_T_C_ROS(4,4);
-  C_T_C_ROS <<  0, -1,  0,  0,   // x = -Y
-                0,  0, -1,  0,   // y = -Z
-                1,  0,  0,  0,   // z = X
+  C_T_C_ROS <<  0, -1,  0,  0,   //  z <= X
+                0,  0, -1,  0,   // -x <= Y
+                1,  0,  0,  0,   // -y <= Z
                 0,  0,  0,  1;
   
   C_T_L = C_T_C_ROS * C_ROS_T_L;
@@ -245,12 +216,10 @@ void callback(const boost::shared_ptr<const sensor_msgs::PointCloud2>& in_pc2 , 
       cloud_out_color->push_back(point);
 
       // Only consider the points in-front
-      if (cloud_in->points[i].x <= 0) continue; // 1 meter
+      if (cloud_in->points[i].x <= 0) continue;
       if (cloud_in->points[i].x < min_range) min_range = cloud_in->points[i].x;
       if (cloud_in->points[i].x > max_range) max_range = cloud_in->points[i].x;
   }
-  cout << "SWAN: min range = " << min_range << endl;
-  cout << "SWAN: max range = " << max_range << endl;
 
   int n = (int) cloud_out_color->points.size(); // number of points
   Eigen::MatrixXf I_p(3, n);
@@ -286,7 +255,7 @@ void callback(const boost::shared_ptr<const sensor_msgs::PointCloud2>& in_pc2 , 
   // C_p = C_T_L * L_p
   C_p = C_T_L * L_p;
 
-  I_p = projectPointDist(C_p, cameraMatrix, distCoeffs);
+  I_p = M * C_p;
 
   float x, y, z;
   int u = 0;
@@ -301,19 +270,16 @@ void callback(const boost::shared_ptr<const sensor_msgs::PointCloud2>& in_pc2 , 
     // SWAN: consider forward LiDAR points only
     if (cloud_out_color->points[i].x <= 0) continue;
 
-    // // C_p
-    // x = I_p(0,i);
-    // y = I_p(1,i);
-    // z = I_p(2,i);
+    // C_p
+    x = I_p(0,i);
+    y = I_p(1,i);
+    z = I_p(2,i);
 
-    // // I_p
-    // u = (int)(x/z);
-    // v = (int)(y/z);
+    // I_p
+    u = (int)(x/z);
+    v = (int)(y/z);
 
-    u = (int)I_p(0, i);
-    v = (int)I_p(1, i);
-
-    if(u < 0 || u >= cols || v < 0 || v >= rows) continue;
+    if(u < 0.0 || u > cols || v < 0.0 || v > rows) continue;
 
     // Colorize the LiDAR points
     // cv::Mat_<cv::Vec3b> I = orig_image;
@@ -377,28 +343,12 @@ int main(int argc, char** argv)
                (double)param[2];
 
   nh.getParam("/matrix_file/camera_matrix", param);
-  // M  << (double)param[0], (double)param[1], (double)param[2],  (double)param[3],
-  //       (double)param[4], (double)param[5], (double)param[6],  (double)param[7],
-  //       (double)param[8], (double)param[9], (double)param[10], (double)param[11];
-  cameraMatrix.at<float>(0, 0) = (double)param[0];
-  cameraMatrix.at<float>(0, 1) = (double)param[1];
-  cameraMatrix.at<float>(0, 2) = (double)param[2];
-
-  cameraMatrix.at<float>(1, 0) = (double)param[4];
-  cameraMatrix.at<float>(1, 1) = (double)param[5];
-  cameraMatrix.at<float>(1, 2) = (double)param[6];
-
-  cameraMatrix.at<float>(2, 0) = (double)param[8];
-  cameraMatrix.at<float>(2, 1) = (double)param[9];
-  cameraMatrix.at<float>(2, 2) = (double)param[10];
+  M  << (double)param[0], (double)param[1], (double)param[2],  (double)param[3],
+        (double)param[4], (double)param[5], (double)param[6],  (double)param[7],
+        (double)param[8], (double)param[9], (double)param[10], (double)param[11];
 
   nh.getParam("/matrix_file/distortion", param);
-  //D << (double)param[0], (double)param[1], (double)param[2],  (double)param[3], (double)param[4];
-  distCoeffs.at<float>(0, 0) = (double)param[0];
-  distCoeffs.at<float>(0, 1) = (double)param[1];
-  distCoeffs.at<float>(0, 2) = (double)param[2];
-  distCoeffs.at<float>(0, 3) = (double)param[3];
-  distCoeffs.at<float>(0, 4) = (double)param[4];
+  D << (double)param[0], (double)param[1], (double)param[2],  (double)param[3], (double)param[4];
 
   // SWAN
   reviseTransformation(L_R_C_ROS, L_t_C_ROS);
